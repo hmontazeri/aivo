@@ -81,7 +81,8 @@ mod tests {
 
         let claude_ctx = KeyCompatContext::Tool(AIToolType::Claude);
         assert!(claude_ctx.incompat_reason(&claude).is_none());
-        assert!(claude_ctx.incompat_reason(&codex).is_some());
+        // Claude Code can run on a Codex OAuth key (bridged to the ChatGPT backend).
+        assert!(claude_ctx.incompat_reason(&codex).is_none());
         assert!(claude_ctx.incompat_reason(&regular).is_none());
 
         let codex_ctx = KeyCompatContext::Tool(AIToolType::Codex);

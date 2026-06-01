@@ -627,6 +627,15 @@ impl EnvironmentInjector {
             return env;
         }
 
+        // Codex OAuth key: Claude Code can't talk to the ChatGPT backend
+        // natively, so aivo bridges its Anthropic requests through the
+        // Anthropic→OpenAI router running in "chatgpt backend" mode (Responses
+        // API against `chatgpt.com/backend-api/codex`, authed with the OAuth
+        // access token). The token is refreshed and injected in launch_runtime.
+        if key.is_codex_oauth() {
+            return Self::for_claude_codex_oauth(key, model, overrides);
+        }
+
         let profile = provider_profile_for_key(key);
         let mode = if profile.kind == ProviderKind::Ollama {
             ConnectionMode::Ollama
@@ -756,6 +765,134 @@ impl EnvironmentInjector {
         ] {
             if let Some(v) = value {
                 env.insert(env_var.to_string(), normalize(v));
+            }
+        }
+
+        env
+    }
+
+    /// Builds the Claude env block for a Codex OAuth credential. Claude Code is
+    /// pointed at the local Anthropic→OpenAI router (placeholder loopback URL,
+    /// rewritten with the bound port in `launch_runtime`), which runs in
+    /// "chatgpt backend" mode: it converts Anthropic `/v1/messages` →
+    /// Responses-API and forwards to `chatgpt.com/backend-api/codex/responses`
+    /// with the OAuth access token. The raw credential JSON and key id are
+    /// passed through so `launch_runtime::prepare_claude_codex_oauth_router`
+    /// can refresh the token, persist any rotation, and overwrite the router's
+    /// API key + account-id env vars with the fresh values before the router
+    /// starts.
+    fn for_claude_codex_oauth(
+        key: &ApiKey,
+        model: Option<&str>,
+        overrides: &ClaudeModelOverrides,
+    ) -> HashMap<String, String> {
+        const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+        // Default to gpt-5.5 when the user doesn't pass `-m`.
+        let effective_model = model.unwrap_or("gpt-5.5");
+
+        let mut env = HashMap::new();
+        // Router scaffolding (mirrors ConnectionMode::Routed for claude, but
+        // built explicitly because the upstream auth is an OAuth token resolved
+        // at launch time, not `key.key`).
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            PLACEHOLDER_LOOPBACK_URL.to_string(),
+        );
+        env.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            "aivo-codex-oauth".to_string(),
+        );
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        env.insert(
+            "AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER".to_string(),
+            "1".to_string(),
+        );
+        // Overwritten with the fresh access token in launch_runtime; a
+        // placeholder keeps the router's required-key check happy if ordering
+        // ever changes.
+        env.insert(
+            "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY".to_string(),
+            "pending".to_string(),
+        );
+        env.insert(
+            "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL".to_string(),
+            CHATGPT_CODEX_BASE_URL.to_string(),
+        );
+        env.insert(
+            "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+            ProviderProtocol::ResponsesApi.as_str().to_string(),
+        );
+        env.insert(
+            "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_CHATGPT_BACKEND".to_string(),
+            "1".to_string(),
+        );
+        // Seed account id from the stored credential; launch_runtime overwrites
+        // it from the refreshed credential (the claim is stable, so this is just
+        // a best-effort head start).
+        if let Ok(creds) =
+            crate::services::codex_oauth::CodexOAuthCredential::from_json(key.key.as_str())
+            && let Some(acct) = creds.account_id
+        {
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_CHATGPT_ACCOUNT_ID".to_string(),
+                acct,
+            );
+        }
+        // Consumed by launch_runtime for the refresh + persist step, then
+        // stripped so neither leaks to the spawned `claude` process.
+        env.insert(
+            "AIVO_CODEX_OAUTH_CREDS".to_string(),
+            key.key.as_str().to_string(),
+        );
+        env.insert("AIVO_CODEX_KEY_ID".to_string(), key.id.clone());
+
+        // Same beta-stripping / timeout policy as routed mode: the upstream is
+        // OpenAI-shaped, so the experimental Anthropic beta fields must go.
+        env.insert(
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS".to_string(),
+            "1".to_string(),
+        );
+        env.insert(
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+            "1".to_string(),
+        );
+        env.insert(
+            "CLAUDE_CODE_ATTRIBUTION_HEADER".to_string(),
+            "0".to_string(),
+        );
+        env.insert("BASH_DEFAULT_TIMEOUT_MS".to_string(), "2400000".to_string());
+        env.insert("BASH_MAX_TIMEOUT_MS".to_string(), "2500000".to_string());
+        env.insert("API_TIMEOUT_MS".to_string(), "30000000".to_string());
+
+        // Model fan-out — no anthropic-native normalization (upstream is the
+        // OpenAI Responses API, so `gpt-5.5` flows through verbatim).
+        let anthropic_model = match overrides.max_context.as_deref() {
+            Some(tag) => format!("{effective_model}[{tag}]"),
+            None => effective_model.to_string(),
+        };
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            env.insert(slot.to_string(), anthropic_model.clone());
+        }
+        env.insert(
+            "ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(),
+            anthropic_model.clone(),
+        );
+        env.insert(
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION".to_string(),
+            format!("Routed via aivo ({})", key.display_name()),
+        );
+        for (env_var, value) in [
+            ("ANTHROPIC_REASONING_MODEL", overrides.reasoning.as_deref()),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", overrides.subagent.as_deref()),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", overrides.haiku.as_deref()),
+            (
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                overrides.sonnet.as_deref(),
+            ),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", overrides.opus.as_deref()),
+        ] {
+            if let Some(v) = value {
+                env.insert(env_var.to_string(), v.to_string());
             }
         }
 
@@ -1607,6 +1744,85 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         crate::services::http_debug::set_test_debug_active(false);
         guard
+    }
+
+    fn codex_oauth_key() -> ApiKey {
+        use crate::services::codex_oauth::{CODEX_OAUTH_SENTINEL, CodexOAuthCredential};
+        let creds = CodexOAuthCredential {
+            id_token: "eyJ".into(),
+            access_token: "access-tok".into(),
+            refresh_token: "refresh-tok".into(),
+            account_id: Some("acct_xyz".into()),
+            email: Some("alice@example.com".into()),
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(3600),
+            last_refresh: chrono::Utc::now(),
+        };
+        ApiKey::new_with_protocol(
+            "kid-1".to_string(),
+            "my-chatgpt".to_string(),
+            CODEX_OAUTH_SENTINEL.to_string(),
+            None,
+            creds.to_json().unwrap(),
+        )
+    }
+
+    #[test]
+    fn for_claude_codex_oauth_routes_to_chatgpt_backend() {
+        let _guard = debug_off_guard();
+        let key = codex_oauth_key();
+        let env = EnvironmentInjector::new().for_claude(&key, Some("gpt-5.5"));
+
+        // Routed through the in-process Anthropic→OpenAI router in chatgpt mode.
+        assert_eq!(env.get("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER").unwrap(), "1");
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_CHATGPT_BACKEND")
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_BASE_URL").unwrap(),
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_UPSTREAM_PROTOCOL")
+                .unwrap(),
+            "responses"
+        );
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_CHATGPT_ACCOUNT_ID")
+                .unwrap(),
+            "acct_xyz"
+        );
+        // Credential + key id forwarded for the launch-time refresh; placeholder
+        // upstream key gets overwritten in launch_runtime.
+        assert!(env.contains_key("AIVO_CODEX_OAUTH_CREDS"));
+        assert_eq!(env.get("AIVO_CODEX_KEY_ID").unwrap(), "kid-1");
+        assert_eq!(
+            env.get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY").unwrap(),
+            "pending"
+        );
+        // ANTHROPIC_API_KEY blanked so Claude Code uses the auth-token path.
+        assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "");
+        // Model fans out verbatim (no anthropic-native normalization).
+        for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
+            assert_eq!(env.get(slot).map(String::as_str), Some("gpt-5.5"));
+        }
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn for_claude_codex_oauth_defaults_model_to_gpt_5_5() {
+        let _guard = debug_off_guard();
+        let key = codex_oauth_key();
+        let env = EnvironmentInjector::new().for_claude(&key, None);
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("gpt-5.5")
+        );
     }
 
     #[test]

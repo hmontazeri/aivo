@@ -103,7 +103,10 @@ impl AIToolType {
     /// used to launch this tool (e.g. a Codex OAuth key for `aivo run claude`),
     /// or `None` when the key is compatible.
     pub fn oauth_incompat_reason(&self, key: &ApiKey) -> Option<&'static str> {
-        let matches_tool = (*self == AIToolType::Claude && key.is_claude_oauth())
+        // Claude Code accepts a Claude OAuth key natively, or a Codex OAuth key
+        // (aivo bridges its Anthropic requests to the ChatGPT codex backend).
+        let matches_tool = (*self == AIToolType::Claude
+            && (key.is_claude_oauth() || key.is_codex_oauth()))
             || (self.is_codex_family() && key.is_codex_oauth())
             || (*self == AIToolType::Gemini && key.is_gemini_oauth());
         if matches_tool {
@@ -1762,6 +1765,37 @@ mod tests {
         assert_eq!(AIToolType::parse("amp"), Some(AIToolType::Amp));
         assert_eq!(AIToolType::parse("Amp"), Some(AIToolType::Amp));
         assert_eq!(AIToolType::parse("unknown"), None);
+    }
+
+    #[test]
+    fn claude_accepts_codex_oauth_key() {
+        use crate::services::codex_oauth::CODEX_OAUTH_SENTINEL;
+        let codex_oauth = ApiKey::new_with_protocol(
+            "id".into(),
+            "codex".into(),
+            CODEX_OAUTH_SENTINEL.into(),
+            None,
+            "secret".into(),
+        );
+        // Claude Code is bridged to the ChatGPT codex backend, so a codex-oauth
+        // key is compatible with `aivo run claude`.
+        assert!(
+            AIToolType::Claude
+                .oauth_incompat_reason(&codex_oauth)
+                .is_none()
+        );
+        // Other tools still reject it (gemini cannot speak the codex backend).
+        assert!(
+            AIToolType::Gemini
+                .oauth_incompat_reason(&codex_oauth)
+                .is_some()
+        );
+        // And codex itself still accepts it.
+        assert!(
+            AIToolType::Codex
+                .oauth_incompat_reason(&codex_oauth)
+                .is_none()
+        );
     }
 
     #[test]

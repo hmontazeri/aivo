@@ -94,6 +94,17 @@ pub(crate) async fn prepare_runtime_env(
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
 
+    // Claude backed by a Codex OAuth credential: refresh the token and inject
+    // the fresh access token + account id into the router env before the router
+    // starts. Must run ahead of `start_anthropic_to_openai_router`, which reads
+    // those vars into its immutable config.
+    if tool == AIToolType::Claude
+        && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER")
+        && env.contains_key("AIVO_CODEX_OAUTH_CREDS")
+    {
+        prepare_claude_codex_oauth_router(&mut env, session_store).await?;
+    }
+
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER") {
         let (port, active, success, authoritative, learned) =
             start_anthropic_to_openai_router(&env).await?;
@@ -333,6 +344,55 @@ async fn prepare_codex_oauth_shadow(
         shadow,
         original: creds,
     })
+}
+
+/// Prepares the in-process Anthropic→OpenAI router env for a Claude launch
+/// backed by a Codex OAuth credential. Refreshes the access token (recovering
+/// via interactive re-login if the refresh token was invalidated), persists any
+/// refresh-token rotation, then overwrites the router's upstream API key +
+/// account-id env vars with the fresh values.
+///
+/// Unlike the native codex path there is no shadow `CODEX_HOME` and no
+/// post-exit reconciliation: the router holds the access token in memory only,
+/// so the single pre-launch rotation persisted here is the whole story.
+async fn prepare_claude_codex_oauth_router(
+    env: &mut HashMap<String, String>,
+    session_store: &SessionStore,
+) -> Result<()> {
+    let raw = env
+        .remove("AIVO_CODEX_OAUTH_CREDS")
+        .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_OAUTH_CREDS"))?;
+    let key_id = env
+        .remove("AIVO_CODEX_KEY_ID")
+        .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_KEY_ID"))?;
+    let original = CodexOAuthCredential::from_json(&raw)?;
+    let mut creds = original.clone();
+
+    if let Err(e) = ensure_fresh(&mut creds, REFRESH_SKEW_SECS).await {
+        if !is_oauth_invalid_grant(&e) {
+            return Err(e);
+        }
+        eprintln!(
+            "{} Codex refresh token is no longer valid — re-authenticating.",
+            crate::style::yellow("aivo:")
+        );
+        creds = crate::services::codex_oauth::interactive_login()
+            .await
+            .map_err(|err| err.context("codex re-login after invalid refresh token"))?;
+    }
+    persist_refreshed_if_needed(session_store, &key_id, &original, &creds).await;
+
+    env.insert(
+        "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_API_KEY".to_string(),
+        creds.access_token.clone(),
+    );
+    if let Some(acct) = creds.account_id.clone() {
+        env.insert(
+            "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_CHATGPT_ACCOUNT_ID".to_string(),
+            acct,
+        );
+    }
+    Ok(())
 }
 
 async fn prepare_codex_app_home_without_auth(
@@ -1333,6 +1393,13 @@ async fn start_anthropic_to_openai_router(
         .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_STRIP_CACHE_CONTROL")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let chatgpt_backend = env
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_CHATGPT_BACKEND")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let chatgpt_account_id = env
+        .get("AIVO_ANTHROPIC_TO_OPENAI_ROUTER_CHATGPT_ACCOUNT_ID")
+        .cloned();
     let config = AnthropicToOpenAIRouterConfig {
         target_base_url: base_url,
         target_api_key: api_key,
@@ -1346,6 +1413,11 @@ async fn start_anthropic_to_openai_router(
             .get("AIVO_IS_STARTER")
             .map(|v| v == "1")
             .unwrap_or(false),
+        chatgpt_backend,
+        chatgpt_account_id,
+        // Stable per-launch conversation id for the codex backend session_id
+        // header (only used when chatgpt_backend is set).
+        chatgpt_session_id: crate::services::codex_oauth::generate_uuid_v4(),
     };
 
     let router = AnthropicToOpenAIRouter::new(config);
@@ -1852,6 +1924,9 @@ async fn start_amp_bridge(env: &mut HashMap<String, String>) -> Result<u16> {
                     requires_reasoning_content: false,
                     max_tokens_cap: None,
                     is_starter,
+                    chatgpt_backend: false,
+                    chatgpt_account_id: None,
+                    chatgpt_session_id: String::new(),
                 });
                 let (port, _active, _success, _auth, _learned, handle) =
                     translator.start_background().await?;

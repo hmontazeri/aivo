@@ -112,6 +112,36 @@ pub fn generate_state() -> String {
     })
 }
 
+/// Generates an RFC 4122 version-4 UUID string (8-4-4-4-12 hex). Used for the
+/// `session_id` header the ChatGPT codex backend expects on `/responses` calls;
+/// the native `codex` client sends a real UUID per conversation. Avoids pulling
+/// in the `uuid` crate — 16 random bytes with the version/variant nibbles set.
+pub fn generate_uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    )
+}
+
 /// Builds the URL the user opens in their browser.
 pub fn build_authorize_url(pkce_challenge: &str, state: &str) -> String {
     let encoded_redirect = crate::services::percent_codec::encode(REDIRECT_URI);
@@ -441,6 +471,26 @@ mod tests {
         let s = generate_state();
         assert_eq!(s.len(), 32);
         assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_uuid_v4_is_rfc_shaped() {
+        let u = generate_uuid_v4();
+        assert_eq!(u.len(), 36);
+        let parts: Vec<&str> = u.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(u.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        // version nibble is '4'; variant nibble is one of 8/9/a/b.
+        assert_eq!(parts[2].chars().next().unwrap(), '4');
+        assert!(matches!(
+            parts[3].chars().next().unwrap(),
+            '8' | '9' | 'a' | 'b'
+        ));
+        // Two draws differ (randomness wired up).
+        assert_ne!(generate_uuid_v4(), generate_uuid_v4());
     }
 
     #[test]

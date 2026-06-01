@@ -78,6 +78,19 @@ pub struct AnthropicToOpenAIRouterConfig {
     pub max_tokens_cap: Option<u64>,
     /// Whether this is the aivo starter provider (requires device fingerprint headers).
     pub is_starter: bool,
+    /// When true, the upstream is the ChatGPT codex backend
+    /// (`chatgpt.com/backend-api/codex`), reached over the Responses API with a
+    /// Codex OAuth access token. This backend is streaming-only, expects
+    /// `store:false`, posts to `<base>/responses` (no `/v1`), and requires the
+    /// `chatgpt-account-id` / `OpenAI-Beta` / `originator` / `session_id`
+    /// headers the native `codex` client sends.
+    pub chatgpt_backend: bool,
+    /// `chatgpt_account_id` claim from the OAuth credential — sent as the
+    /// `chatgpt-account-id` header when `chatgpt_backend` is set.
+    pub chatgpt_account_id: Option<String>,
+    /// Stable per-session UUID sent as the `session_id` header (codex treats it
+    /// as a conversation id). Only meaningful when `chatgpt_backend` is set.
+    pub chatgpt_session_id: String,
 }
 
 pub struct AnthropicToOpenAIRouter {
@@ -715,7 +728,11 @@ async fn handle_anthropic_to_upstream(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let candidates = router_candidates(active_protocol, &config.target_base_url);
+    let candidates = router_candidates(
+        active_protocol,
+        &config.target_base_url,
+        config.chatgpt_backend,
+    );
     // Seed first_error with the native-Anthropic Terminal response (if any) so
     // a chat fallback that also exhausts surfaces *some* error to the client.
     // The chat-loop's "is_terminal" branch will overwrite this with the more
@@ -785,15 +802,41 @@ async fn handle_anthropic_to_upstream(
             }
             ProviderProtocol::ResponsesApi => {
                 let mut responses_body = convert_chat_to_responses_request(&req_body)?;
-                responses_body["stream"] = json!(false);
-                let url = build_responses_url(&config.target_base_url, variant);
+                let url = if config.chatgpt_backend {
+                    // ChatGPT codex backend: streaming-only and ephemeral
+                    // (store false), posted to `<base>/responses`.
+                    responses_body["stream"] = json!(true);
+                    responses_body["store"] = json!(false);
+                    // The codex backend rejects sampling/length params that the
+                    // native `codex` client never sends for gpt-5.x reasoning
+                    // models (e.g. `max_output_tokens` → HTTP 400 "Unsupported
+                    // parameter"). Strip them rather than guess valid values.
+                    if let Some(obj) = responses_body.as_object_mut() {
+                        obj.remove("max_output_tokens");
+                        obj.remove("temperature");
+                        obj.remove("top_p");
+                    }
+                    build_chatgpt_codex_responses_url(&config.target_base_url)
+                } else {
+                    responses_body["stream"] = json!(false);
+                    build_responses_url(&config.target_base_url, variant)
+                };
+                let mut req = client
+                    .post(&url)
+                    .headers(attempt_headers)
+                    .header("Authorization", format!("Bearer {}", config.target_api_key))
+                    .header("Content-Type", CONTENT_TYPE_JSON);
+                if config.chatgpt_backend {
+                    // Extra auth headers mirror the native codex client.
+                    for (name, value) in chatgpt_codex_headers(
+                        config.chatgpt_account_id.as_deref(),
+                        &config.chatgpt_session_id,
+                    ) {
+                        req = req.header(name, value);
+                    }
+                }
                 let response = device_fingerprint::maybe_with_starter_headers(
-                    client
-                        .post(&url)
-                        .headers(attempt_headers)
-                        .header("Authorization", format!("Bearer {}", config.target_api_key))
-                        .header("Content-Type", CONTENT_TYPE_JSON)
-                        .json(&responses_body),
+                    req.json(&responses_body),
                     config.is_starter,
                 )
                 .send_logged()
@@ -803,6 +846,16 @@ async fn handle_anthropic_to_upstream(
                 let response_body = response.text().await?;
                 let parsed = if is_protocol_mismatch(status_code) {
                     None
+                } else if config.chatgpt_backend {
+                    // Streaming-only: aggregate the SSE into the final Responses
+                    // object before the standard Responses→chat→Anthropic
+                    // conversion. v1 emits the result as one Anthropic SSE turn.
+                    let resp = aggregate_responses_sse(&response_body)?;
+                    let openai_response = convert_responses_to_chat_response(&resp)?;
+                    Some(openai_chat_response_to_anthropic_router(
+                        &openai_response,
+                        requested_stream,
+                    )?)
                 } else {
                     let resp: Value = serde_json::from_str(&response_body)?;
                     let openai_response = convert_responses_to_chat_response(&resp)?;
@@ -1069,6 +1122,97 @@ fn build_responses_url(base_url: &str, variant: PathVariant) -> String {
     http_utils::build_target_url(base_url, variant.apply("/v1/responses"))
 }
 
+/// Build the ChatGPT codex backend responses URL: `<base>/responses` with no
+/// `/v1` segment. The base is `https://chatgpt.com/backend-api/codex`; this
+/// deliberately bypasses `build_target_url`'s `/v1` assumption and
+/// segment-overlap logic, which are wrong for this host.
+fn build_chatgpt_codex_responses_url(base_url: &str) -> String {
+    format!("{}/responses", base_url.trim_end_matches('/'))
+}
+
+/// Extract the `data:` payload of a single SSE event chunk. Mirrors the helper
+/// in `amp_bridge.rs`; kept local to avoid a cross-module pub export.
+fn responses_sse_data(chunk: &str) -> Option<&str> {
+    if let Some(stripped) = chunk.strip_prefix("data: ") {
+        return Some(stripped);
+    }
+    let idx = chunk.find("\ndata: ")?;
+    Some(&chunk[idx + "\ndata: ".len()..])
+}
+
+/// Aggregate a Responses-API SSE stream into the final Responses object.
+///
+/// The ChatGPT codex backend is streaming-only and terminates with a
+/// `response.completed` (or `response.incomplete`) event carrying the response
+/// envelope (id/model/usage). Crucially, because we send `store:false`, that
+/// terminal envelope's `output` array is **empty** — the actual output items
+/// (the assistant `message`, any `function_call`s, reasoning) arrive in
+/// `response.output_item.done` events along the way. So we collect those items
+/// and graft them onto the terminal envelope before handing it to the standard
+/// `convert_responses_to_chat_response`.
+///
+/// v1 buffers the whole stream and converts once (no token-by-token output);
+/// the caller re-frames the result as a single Anthropic SSE turn.
+fn aggregate_responses_sse(body: &str) -> Result<Value> {
+    let mut done_items: Vec<Value> = Vec::new();
+    let mut completed: Option<Value> = None;
+    for chunk in body.split("\n\n") {
+        let Some(data) = responses_sse_data(chunk) else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    done_items.push(item.clone());
+                }
+            }
+            Some("response.completed") | Some("response.incomplete") => {
+                if let Some(resp) = event.get("response") {
+                    completed = Some(resp.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut response = completed
+        .ok_or_else(|| anyhow::anyhow!("codex backend stream had no response.completed event"))?;
+    // Backfill `output` from the streamed item-done events when the terminal
+    // envelope omitted it (the store:false case).
+    let output_empty = response
+        .get("output")
+        .and_then(|o| o.as_array())
+        .is_none_or(|a| a.is_empty());
+    if output_empty && !done_items.is_empty() {
+        response["output"] = Value::Array(done_items);
+    }
+    Ok(response)
+}
+
+/// Header set the ChatGPT codex backend requires on `/responses`, as a pure
+/// list so it can be unit-tested without a live request. `account_id` may be
+/// absent on older credentials; the others are always sent.
+fn chatgpt_codex_headers(
+    account_id: Option<&str>,
+    session_id: &str,
+) -> Vec<(&'static str, String)> {
+    let mut headers = vec![
+        ("OpenAI-Beta", "responses=experimental".to_string()),
+        ("originator", "codex_cli_rs".to_string()),
+        ("session_id", session_id.to_string()),
+    ];
+    if let Some(acct) = account_id {
+        headers.push(("chatgpt-account-id", acct.to_string()));
+    }
+    headers
+}
+
 /// Wrap an OpenAI Chat Completions response as a buffered Anthropic-format
 /// `RouterResponse`, emitting SSE when `streaming` is true and JSON otherwise.
 fn openai_chat_response_to_anthropic_router(
@@ -1106,8 +1250,12 @@ fn openai_chat_response_to_anthropic_router(
 fn router_candidates(
     active_protocol: &AtomicU8,
     target_base_url: &str,
+    chatgpt_backend: bool,
 ) -> Vec<(ProviderProtocol, PathVariant)> {
-    let allow_responses_fallback = is_direct_openai_base(target_base_url);
+    // The ChatGPT codex backend speaks the Responses API at a non-OpenAI host,
+    // so keep the ResponsesApi candidate even though `is_direct_openai_base`
+    // rejects `chatgpt.com`.
+    let allow_responses_fallback = chatgpt_backend || is_direct_openai_base(target_base_url);
     protocol_candidates(active_protocol)
         .into_iter()
         .filter(|(proto, _)| *proto != ProviderProtocol::Anthropic)
@@ -2241,6 +2389,9 @@ mod tests {
             requires_reasoning_content: false,
             max_tokens_cap: None,
             is_starter: false,
+            chatgpt_backend: false,
+            chatgpt_account_id: None,
+            chatgpt_session_id: String::new(),
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();
@@ -2266,6 +2417,9 @@ mod tests {
             requires_reasoning_content: false,
             max_tokens_cap: None,
             is_starter: false,
+            chatgpt_backend: false,
+            chatgpt_account_id: None,
+            chatgpt_session_id: String::new(),
         };
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();
@@ -2641,14 +2795,14 @@ data: [DONE]\n";
     #[test]
     fn router_candidates_drops_anthropic_always() {
         let active = AtomicU8::new(ProviderProtocol::Openai.to_u8());
-        let cands = router_candidates(&active, "https://api.openai.com/v1");
+        let cands = router_candidates(&active, "https://api.openai.com/v1", false);
         assert!(!cands.iter().any(|(p, _)| *p == ProviderProtocol::Anthropic));
     }
 
     #[test]
     fn router_candidates_keeps_responses_for_openai() {
         let active = AtomicU8::new(ProviderProtocol::Openai.to_u8());
-        let cands = router_candidates(&active, "https://api.openai.com/v1");
+        let cands = router_candidates(&active, "https://api.openai.com/v1", false);
         assert!(
             cands
                 .iter()
@@ -2662,6 +2816,7 @@ data: [DONE]\n";
         let cands = router_candidates(
             &active,
             "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1",
+            false,
         );
         assert!(
             !cands
@@ -2670,6 +2825,99 @@ data: [DONE]\n";
         );
         // Other fallbacks (Openai variants, Google) still present.
         assert!(cands.iter().any(|(p, _)| *p == ProviderProtocol::Google));
+    }
+
+    #[test]
+    fn router_candidates_keeps_responses_for_chatgpt_backend() {
+        // The codex backend isn't api.openai.com, but chatgpt_backend forces
+        // the Responses candidate to survive the filter.
+        let active = AtomicU8::new(ProviderProtocol::ResponsesApi.to_u8());
+        let cands = router_candidates(&active, "https://chatgpt.com/backend-api/codex", true);
+        assert!(
+            cands
+                .iter()
+                .any(|(p, _)| *p == ProviderProtocol::ResponsesApi),
+            "chatgpt backend must keep the Responses candidate"
+        );
+    }
+
+    #[test]
+    fn build_chatgpt_codex_responses_url_appends_responses() {
+        assert_eq!(
+            build_chatgpt_codex_responses_url("https://chatgpt.com/backend-api/codex"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        // Idempotent on a trailing slash; never produces `/v1/responses`.
+        assert_eq!(
+            build_chatgpt_codex_responses_url("https://chatgpt.com/backend-api/codex/"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn aggregate_responses_sse_extracts_completed() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi there\"}]}]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let resp = aggregate_responses_sse(sse).unwrap();
+        assert_eq!(resp["id"], "r1");
+        assert_eq!(resp["status"], "completed");
+        // Round-trips through the existing Responses→chat converter to text.
+        let chat = convert_responses_to_chat_response(&resp).unwrap();
+        assert_eq!(
+            chat["choices"][0]["message"]["content"], "hi there",
+            "completed response should convert to the assistant text"
+        );
+    }
+
+    #[test]
+    fn aggregate_responses_sse_errors_without_completed() {
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        assert!(aggregate_responses_sse(sse).is_err());
+    }
+
+    #[test]
+    fn aggregate_responses_sse_backfills_output_from_item_done() {
+        // The store:false case the codex backend actually returns: the terminal
+        // `response.completed` envelope has an EMPTY `output`, and the message
+        // arrives in a `response.output_item.done` event.
+        let sse = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"here and ready\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let resp = aggregate_responses_sse(sse).unwrap();
+        assert_eq!(resp["id"], "resp_1");
+        // Output backfilled from the item-done events.
+        assert_eq!(resp["output"].as_array().unwrap().len(), 2);
+        let chat = convert_responses_to_chat_response(&resp).unwrap();
+        assert_eq!(chat["choices"][0]["message"]["content"], "here and ready");
+    }
+
+    #[test]
+    fn chatgpt_codex_headers_includes_all_required() {
+        let h = chatgpt_codex_headers(Some("acct_1"), "sess-123");
+        let get = |n: &str| h.iter().find(|(k, _)| *k == n).map(|(_, v)| v.as_str());
+        assert_eq!(get("OpenAI-Beta"), Some("responses=experimental"));
+        assert_eq!(get("originator"), Some("codex_cli_rs"));
+        assert_eq!(get("session_id"), Some("sess-123"));
+        assert_eq!(get("chatgpt-account-id"), Some("acct_1"));
+        // account id omitted when absent.
+        assert!(
+            chatgpt_codex_headers(None, "s")
+                .iter()
+                .all(|(k, _)| *k != "chatgpt-account-id")
+        );
     }
 
     #[test]
